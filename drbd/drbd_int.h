@@ -629,6 +629,9 @@ enum peer_device_flag {
 	INITIAL_STATE_SENT,
 	INITIAL_STATE_RECEIVED,
 	RECONCILIATION_RESYNC,
+	RECONCILE_PENDING,	/* post-loss reconcile owed, not yet armed;
+				 * bridges loss -> RECONCILIATION_RESYNC
+				 */
 	UNSTABLE_RESYNC,	/* Sync source went unstable during resync. */
 	SEND_STATE_AFTER_AHEAD,
 	GOT_NEG_ACK,		/* got a neg_ack while primary, wait until peer_disk is lower than
@@ -660,16 +663,18 @@ enum peer_device_flag {
 				   * it took). Until the peer confirms, the handshake
 				   * trusts the peer's reported UUID and the rotated
 				   * gen is not yet confirmed durable on this peer.
-				   * Cleared by any in-order ack at/past the bump
-				   * epoch: the UUID is written FUA on receipt, so
-				   * receipt proves it durable.
+				   * Cleared only on the peer's own data evidence by
+				   * drbd_peer_maybe_confirm_rotated_gen(): every held
+				   * write of the gen durable on the peer, or, none
+				   * held, a barrier ack at/past the gen's epoch.
 				   */
 	RECONCILE_INJECT_CUR_UUID, /* This peer returned on our predecessor
-				    * generation; we presented the predecessor during
-				    * the handshake so it stays UpToDate.  Armed so that
-				    * once it settles UpToDate we relabel it forward to
-				    * our current generation.  See
-				    * diskless_primary_present_current_uuid().
+				    * generation.  We assert it UpToDate anyway
+				    * (it holds a complete generation and the
+				    * bridging writes are still replayable) and arm
+				    * this so that, once it settles UpToDate, we
+				    * relabel it forward to our current generation.
+				    * See diskless_with_peers_different_current_uuids().
 				    */
 	PEER_DEVICE_FLAG_COUNT,	/* keep last: sizes peer_device->flags[] */
 };
@@ -1500,11 +1505,6 @@ struct drbd_peer_device {
 
 	unsigned long comm_bm_set; /* communicated number of set bits. */
 	u64 comm_current_uuid; /* communicated current UUID */
-	unsigned int current_uuid_epoch; /* write epoch in which we optimistically
-					  * sent this peer the current UUID; with
-					  * CURRENT_UUID_UNCONFIRMED, used to detect
-					  * when the peer has processed past it.
-					  */
 	u64 comm_uuid_flags; /* communicated UUID flags */
 	u64 comm_bitmap_uuid;
 	union drbd_state comm_state;
@@ -1725,27 +1725,16 @@ struct drbd_device {
 	struct work_struct finalize_work;
 };
 
-/* Clear CURRENT_UUID_UNCONFIRMED once the peer communicates back about the data
- * stream at/past the epoch the new UUID was sent in (acked_epoch: req->epoch for
- * a write/recv ack or read reply, or the barrier number). The data socket is
- * in order and the UUID is written FUA on receipt, so any such ack proves the
- * peer holds the rotated generation durably. The device-level "confirmed across
- * a quorate set" decision is drbd_maybe_release_rotated_gen()'s, run afterwards.
- */
-static inline void drbd_peer_uuid_confirmed_by_epoch(struct drbd_peer_device *peer_device,
-						     unsigned int acked_epoch)
-{
-	if ((int)(acked_epoch - peer_device->current_uuid_epoch) < 0)
-		return;
-
-	clear_bit(CURRENT_UUID_UNCONFIRMED, peer_device->flags);
-}
+/* Per-peer CURRENT_UUID_UNCONFIRMED clear; defined in drbd_req.c. */
+extern void drbd_peer_maybe_confirm_rotated_gen(struct drbd_peer_device *peer_device,
+						unsigned int acked_epoch);
 
 /* Device-level decision for the per-peer signals above; defined in
  * drbd_receiver.c.  Returns true (clearing EXPOSED_GEN_UNCONFIRMED) when the
  * rotated generation just became confirmed across a quorate set of survivors.
  */
 extern bool drbd_maybe_release_rotated_gen(struct drbd_device *device);
+extern void drbd_reconcile_settled_try_up_to_date(struct drbd_resource *resource);
 
 struct drbd_bm_aio_ctx {
 	struct drbd_device *device;

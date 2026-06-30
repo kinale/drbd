@@ -2737,12 +2737,6 @@ static int receive_DataReply(struct drbd_connection *connection, struct packet_i
 	if (unlikely(!req))
 		return -EIO;
 
-	/* A reply to a remote read we issued after sending the new current UUID
-	 * proves the peer received it (handshake confirmation only -- not durable,
-	 * so it does not release the completion hold; see
-	 * validate_req_change_req_state and got_BarrierAck).
-	 */
-	drbd_peer_uuid_confirmed_by_epoch(peer_device, req->epoch);
 	err = recv_dless_read(peer_device, req, sector, pi->size);
 	if (!err)
 		req_mod(req, DATA_RECEIVED, peer_device);
@@ -6581,6 +6575,25 @@ static void drbd_resync(struct drbd_peer_device *peer_device,
 			  reason == AFTER_UNSTABLE ? "after unstable" : "because primary is diskless");
 	}
 
+	/* No reconciliation resync with an UpToDate peer: we hold the current
+	 * generation, so we owe no post-loss reconcile to anyone.
+	 * Clear RECONCILE_PENDING and return to UpToDate (do not stay Consistent)
+	 */
+	if (new_repl_state == L_ESTABLISHED && peer_disk_state == D_UP_TO_DATE &&
+	    peer_device->device->disk_state[NOW] == D_CONSISTENT) {
+		struct drbd_device *device = peer_device->device;
+		struct drbd_peer_device *pd;
+		bool cleared = false;
+
+		rcu_read_lock();
+		for_each_peer_device_rcu(pd, device)
+			if (test_and_clear_bit(RECONCILE_PENDING, pd->flags))
+				cleared = true;
+		rcu_read_unlock();
+		if (cleared)
+			drbd_reconcile_settled_try_up_to_date(device->resource);
+	}
+
 	if (new_repl_state == L_ESTABLISHED && peer_disk_state >= D_CONSISTENT &&
 	    peer_device->device->disk_state[NOW] == D_OUTDATED) {
 		/* No resync with up-to-date peer -> I should be consistent or up-to-date as well.
@@ -6834,12 +6847,6 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 						(device->exposed_data_uuid & ~UUID_PRIMARY))
 		peer_device->current_uuid = be64_to_cpu(p->current_uuid);
 
-	/* The peer just told us its current UUID in this handshake; whatever we
-	 * now hold reflects reality, so the optimistic-bump assumption is
-	 * resolved either way.
-	 */
-	clear_bit(CURRENT_UUID_UNCONFIRMED, peer_device->flags);
-
 	peer_device->dirty_bits = be64_to_cpu(p->dirty_bits);
 	peer_device->uuid_flags = be64_to_cpu(p->uuid_flags);
 	if (peer_device->uuid_flags & UUID_FLAG_HAS_UNALLOC) {
@@ -6857,14 +6864,6 @@ static int receive_uuids110(struct drbd_connection *connection, struct packet_in
 			if (peer_md && !(peer_md[i].flags & MDF_HAVE_BITMAP) &&
 			    i != not_allocated)
 				peer_md[i].flags |= MDF_NODE_EXISTS;
-
-			/* ldev_safe: peer_md is non-NULL only while we hold
-			 * get_ldev() + uuid_lock (taken together above). Record
-			 * the peer's bitmap slots in our history, not the day0 hint.
-			 */
-			if (peer_md && i != not_allocated &&
-			    i != device->resource->res_opts.node_id)
-				_drbd_uuid_push_history(device, bitmap_uuid);
 		} else {
 			bitmap_uuid = -1;
 		}
@@ -8392,49 +8391,12 @@ bool diskless_primary_can_replay_to(struct drbd_peer_device *peer_device)
 	return have_resendable;
 }
 
-/* What current UUID should a diskless primary present to this peer during the
- * connection handshake?
- *
- * While our new current generation is still unconfirmed (EXPOSED_GEN_UNCONFIRMED)
- * a peer that returns on the generation we bumped away from
- * (exposed_data_uuid_predecessor) holds equivalent data -- the writes bridging
- * the two are unacknowledged and still in our (suspended) transfer log.  If we
- * presented our (unconfirmed) current UUID, the peer would see a generation it
- * does not have and outdate itself (drbd_diskless_moved_on -> receive_current_uuid).
- * Instead we present the predecessor, which matches what the peer already has, so
- * it stays UpToDate and the 2PC handshake commits cleanly.  We arm
- * RECONCILE_INJECT_CUR_UUID: once the handshake has committed, the transfer-log
- * replay re-sends the bridging writes and injects the real current UUID, advancing
- * the peer to our current generation deterministically (no race with the outdate).
- *
- * Only do this when the bridging writes are still replayable; otherwise present
- * the real current UUID and let the normal mismatch handling refuse honestly
- * (the peer must then resync from a diskful peer that holds good data).
+/* Present our actual exposed current generation to a returning peer.
+ * Reverts 308cf12f2's present-predecessor (see commit message).
  */
 u64 diskless_primary_present_current_uuid(struct drbd_peer_device *peer_device)
 {
-	struct drbd_device *device = peer_device->device;
-
-	/* While our current generation is unconfirmed, no peer can hold it (any
-	 * confirmation clears EXPOSED_GEN_UNCONFIRMED), so the predecessor is the
-	 * honest value to present.  We deliberately do NOT gate on
-	 * peer_device->current_uuid: at handshake emit time it may still be the
-	 * optimistic value we recorded at the bump (not yet refreshed to the peer's
-	 * actually-reported UUID), which would make us present the current and
-	 * outdate the peer.  Present the predecessor whenever the bridging writes to
-	 * this peer are still replayable; arm the post-handshake relabel.  A peer
-	 * that turns out to be more than one generation behind will not match the
-	 * predecessor either and outdates itself (correctly: it must resync from a
-	 * diskful peer), and the relabel never fires for it (it never reaches
-	 * UpToDate).  See SEND_RECONCILE_UUID / send_reconcile_current_uuid().
-	 */
-	if (test_bit(EXPOSED_GEN_UNCONFIRMED, &device->flags) &&
-	    device->exposed_data_uuid_predecessor &&
-	    diskless_primary_can_replay_to(peer_device)) {
-		set_bit(RECONCILE_INJECT_CUR_UUID, peer_device->flags);
-		return device->exposed_data_uuid_predecessor;
-	}
-	return device->exposed_data_uuid;
+	return peer_device->device->exposed_data_uuid;
 }
 
 static void diskless_with_peers_different_current_uuids(struct drbd_peer_device *peer_device,
@@ -8469,10 +8431,11 @@ static void diskless_with_peers_different_current_uuids(struct drbd_peer_device 
 		 * data is a complete, valid generation -- equivalent to our current
 		 * minus the unacknowledged in-flight writes -- so assert it UpToDate
 		 * now (a sole diskful peer cannot promote itself against a diskless
-		 * primary; we presented the predecessor so it agrees).  The
-		 * post-handshake relabel (RECONCILE_INJECT_CUR_UUID -> SEND_RECONCILE_UUID)
-		 * then advances it to our current generation, the replayed writes
-		 * filling the gap.  See diskless_primary_present_current_uuid().
+		 * primary; the "Do not trust this guy" exception in sanitize_state
+		 * honors RECONCILE_INJECT_CUR_UUID and keeps it UpToDate despite the
+		 * UUID mismatch).  The post-handshake relabel
+		 * (RECONCILE_INJECT_CUR_UUID -> SEND_RECONCILE_UUID) then advances it
+		 * to our current generation, the replayed writes filling the gap.
 		 */
 		drbd_info(peer_device,
 			  "Peer is one generation behind; asserting UpToDate, will resend transfer log and relabel.\n");
@@ -8758,17 +8721,9 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 		   peer a source for my data anyways. */
 		if (exposed_data_uuid && peer_state.disk == D_UP_TO_DATE &&
 		    (exposed_data_uuid & ~UUID_PRIMARY) == (peer_current_uuid & ~UUID_PRIMARY)) {
-			/* The peer presents our current generation: it adopted the UUID we
-			 * sent before the connection was lost, even though we may never have
-			 * seen the confirming ack.  Its presence here IS durable proof for
-			 * this peer -- clear its unconfirmed mark and cancel any pending
-			 * reconcile relabel.  The device-level EXPOSED_GEN_UNCONFIRMED is
-			 * cleared by the informed-confirmation hook (drbd_maybe_release_-
-			 * rotated_gen) post-commit of this handshake's state change, once we
-			 * are quorate with this peer UpToDate -- which also releases the held
-			 * completions.
+			/* The peer is already on our current generation's label, so
+			 * the pending predecessor->current reconcile relabel is moot.
 			 */
-			clear_bit(CURRENT_UUID_UNCONFIRMED, peer_device->flags);
 			clear_bit(RECONCILE_INJECT_CUR_UUID, peer_device->flags);
 		} else if (exposed_data_uuid && peer_state.disk == D_UP_TO_DATE &&
 			   (exposed_data_uuid & ~UUID_PRIMARY) !=
@@ -9533,6 +9488,11 @@ static int receive_peer_dagtag(struct drbd_connection *connection, struct packet
 			}
 		}
 	}
+
+	/* hand the bridge over to RECONCILIATION_RESYNC, or discharge if none owed */
+	idr_for_each_entry(&connection->peer_devices, peer_device, vnr)
+		clear_bit(RECONCILE_PENDING, peer_device->flags);
+	drbd_reconcile_settled_try_up_to_date(resource);
 
 out:
 	kref_debug_put(&lost_peer->kref_debug, 12);
@@ -10398,6 +10358,11 @@ static void drbd_notify_peers_lost_primary(struct drbd_connection *lost_peer)
 			    peer_device->disk_state[NOW] < D_INCONSISTENT)
 				continue; /* Ignore if one side is diskless */
 
+			/* owe a reconcile to this peer; set before NOTIFY clears,
+			 * which receive_peer_dagtag waits for (gap-free handover)
+			 */
+			set_bit(RECONCILE_PENDING, peer_device->flags);
+
 			drbd_send_current_uuid(peer_device, current_uuid, weak_nodes);
 			send_dagtag = true;
 		}
@@ -10469,7 +10434,8 @@ bool drbd_maybe_release_rotated_gen(struct drbd_device *device)
 
 	if (!test_and_clear_bit(EXPOSED_GEN_UNCONFIRMED, &device->flags))
 		return false;
-	drbd_info(device, "rotated data generation confirmed durable in a quorate partition\n");
+	drbd_info(device, "rotated data generation confirmed durable in a quorate partition (gen %016llX)\n",
+		  device->exposed_data_uuid);
 	return true;
 }
 
@@ -10479,6 +10445,7 @@ static void conn_disconnect(struct drbd_connection *connection)
 	struct drbd_peer_device *peer_device;
 	enum drbd_conn_state oc;
 	unsigned long irq_flags;
+	bool reconsider = false;
 	int vnr, i;
 
 	clear_bit(CONN_DRY_RUN, &connection->flags);
@@ -10628,7 +10595,19 @@ static void conn_disconnect(struct drbd_connection *connection)
 	if (test_bit(NOTIFY_PEERS_LOST_PRIMARY, &connection->flags)) {
 		drbd_notify_peers_lost_primary(connection);
 		clear_bit(NOTIFY_PEERS_LOST_PRIMARY, &connection->flags);
+		reconsider = true;
 	}
+
+	/* a surviving peer we owe a reconcile to is itself leaving:
+	 * discharge it, else we stay pinned at Consistent forever
+	 */
+	idr_for_each_entry(&connection->peer_devices, peer_device, vnr)
+		if (test_and_clear_bit(RECONCILE_PENDING, peer_device->flags))
+			reconsider = true;
+
+	/* re-arm once nothing is owed (2-node case arms no RECONCILE_PENDING) */
+	if (reconsider)
+		drbd_reconcile_settled_try_up_to_date(resource);
 
 	if (oc == C_DISCONNECTING)
 		change_cstate_tag(connection, C_STANDALONE, CS_VERBOSE | CS_HARD | CS_LOCAL_ONLY,
@@ -11317,15 +11296,6 @@ validate_req_change_req_state(struct drbd_peer_device *peer_device, u64 id, sect
 	spin_unlock_irq(&device->interval_lock);
 	if (unlikely(!req))
 		return -EIO;
-	/* This ack refers to a request the peer received; if that request is in
-	 * (or past) the epoch in which we optimistically sent it the current
-	 * UUID, the peer received the UUID -> confirm it for the handshake.  This
-	 * is a write/recv ack: the data may still be in a volatile cache, so it
-	 * is not durable and does not release the completion hold (only the
-	 * barrier ack does; see got_BarrierAck).  req->epoch is set once at
-	 * submission; req stays alive until req_mod() below.
-	 */
-	drbd_peer_uuid_confirmed_by_epoch(peer_device, req->epoch);
 	req_mod(req, what, peer_device);
 
 	return 0;
@@ -11535,28 +11505,21 @@ static int got_BarrierAck(struct drbd_connection *connection, struct packet_info
 	bool release_gen = false;
 	int vnr, err;
 
-	/* A barrier ack is an in-order signal that the peer processed everything
-	 * up to this epoch, including a current UUID sent at the epoch boundary;
-	 * clear the per-peer confirmation marks and re-evaluate the release.
-	 * p->barrier is the epoch token the peer echoed back, directly comparable
-	 * to current_uuid_epoch.
+	/* tl_release flushes this epoch (RQ_NET_DONE) first, so the confirm below
+	 * sees the just-flushed held writes.
 	 */
-	rcu_read_lock();
-	idr_for_each_entry(&connection->peer_devices, peer_device, vnr)
-		drbd_peer_uuid_confirmed_by_epoch(peer_device, p->barrier);
-	rcu_read_unlock();
-
 	err = tl_release(connection, 0, 0, p->barrier, be32_to_cpu(p->set_size));
 
-	/* This peer's durable confirmation may complete the "every surviving sync
-	 * peer has it, and we are quorate" picture for one or more devices: release
-	 * any now-confirmed generation's held completions.
+	/* confirm any peer that has now durably persisted all the generation's
+	 * held writes, then re-evaluate the release gate.
 	 */
 	if (!err) {
 		rcu_read_lock();
-		idr_for_each_entry(&connection->peer_devices, peer_device, vnr)
+		idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
+			drbd_peer_maybe_confirm_rotated_gen(peer_device, p->barrier);
 			if (drbd_maybe_release_rotated_gen(peer_device->device))
 				release_gen = true;
+		}
 		rcu_read_unlock();
 		if (release_gen)
 			tl_walk(connection, NULL, NEW_UUID_CONFIRMED);
